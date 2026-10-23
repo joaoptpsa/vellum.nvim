@@ -78,8 +78,15 @@ Options (the defaults):
 ```lua
 require('vellum').setup({
   max_width = 100, -- widest text column in the preview
+  max_pixels = nil, -- most pixels in one rendered diagram, math or non-PNG image; nil for no cap
 })
 ```
+
+Diagrams render at 2 device pixels per CSS pixel; local PNG files go to the
+terminal as they are. Some terminal multiplexers
+silently drop large images: herdr 0.9.5 shows nothing above about 5.9
+megapixels. Set `max_pixels = 5.5e6` there, and big diagrams render at a lower
+scale instead. They keep their size in the preview but look softer when zoomed.
 
 ## Supported
 

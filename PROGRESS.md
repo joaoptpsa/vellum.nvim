@@ -8,7 +8,7 @@ Math: inline `$…$` becomes Unicode text (`latex.lua`); `$$…$$` and ```` ```m
 
 Rendering is split by job: `render.lua` (blocks), `inline.lua` (inline text, wrap), `code.lua` (code panels, diagrams), `media.lua` (images), `latex.lua` (math). The renderer starts on `:Vellum`; the PNG cache is capped at 100 MB.
 
-Resizing the pane stays smooth. The renderer restarts after a crash. `nvim --clean -l test/run.lua`: 142 checks green.
+Resizing the pane stays smooth. The renderer restarts after a crash. `nvim --clean -l test/run.lua`: 149 checks green.
 
 ## What's next
 
@@ -37,3 +37,4 @@ Candidates: vimdoc + CI; WezTerm once its placeholder PR (wezterm#7924) ships; G
 - **The preview must never scroll sideways.** Image rows carry kitty diacritics on their first cell only; shift it off and every row shows row 0. `scrolled()` pins `leftcol` to 0. Headless never fires `WinScrolled`; check it in tmux.
 - **Kitty ignores the source rectangle (`x,y,w,h`) on placeholder placements.** The zoom viewer crops by naming cells instead, so zoom stops where the image reaches 297 cells on a side.
 - **tmux can drop a kitty placement command under a burst of redraws** (fast wheel zoom). The text is right but the picture keeps an old size. The zoom viewer re-sends its placement 100 ms after the last event.
+- **herdr drops kitty images above about 5.9 MP without a word.** `max_pixels = 5.5e6` lowers big renders' scale under it. Chrome's screenshots carry no pHYs; the renderer adds one with the scale, read by `image.png_density()`.
