@@ -10,7 +10,7 @@ local links = require('vellum.links')
 local api = vim.api
 local M = {}
 
-M.config = { max_width = 100 }
+M.config = { max_width = 100, tab = false }
 
 local ns = api.nvim_create_namespace('vellum')
 local group = api.nvim_create_augroup('vellum', { clear = true })
@@ -92,6 +92,14 @@ local function scrolled()
   end
 end
 
+-- tab mode puts the focus, and its window pins the buffer, where Tab keys the user
+-- associates with moving around must move tab pages; their own bindings return on close
+local function tabkeys(buf)
+  vim.keymap.set('n', '<Tab>', '<Cmd>tabnext<cr>', { buffer = buf, desc = 'Next tab page' })
+  vim.keymap.set('n', 'gt', '<Cmd>tabnext<cr>', { buffer = buf, desc = 'Next tab page' })
+  vim.keymap.set('n', '<S-Tab>', '<Cmd>tabprevious<cr>', { buffer = buf, desc = 'Previous tab page' })
+end
+
 local function draw()
   if not valid() then return end
   local lines
@@ -134,7 +142,19 @@ function M.open()
   S = { src = api.nvim_get_current_buf(), buf = api.nvim_create_buf(false, true), anchors = {}, rows = {}, margin = 0 }
   vim.bo[S.buf].bufhidden = 'wipe'
   api.nvim_buf_set_name(S.buf, 'vellum://preview')
-  S.win = api.nvim_open_win(S.buf, false, { split = 'right', win = api.nvim_get_current_win() })
+  -- `tab = true`: the preview takes a tab of its own, not a place beside the
+  -- source. tabnew leaves one empty window, and the preview buffer goes into
+  -- it, so the tab holds nothing else and closing the preview closes the tab.
+  local from = api.nvim_get_current_win()
+  if M.config.tab then
+    vim.cmd('tabnew')
+    S.win = api.nvim_get_current_win()
+    api.nvim_win_set_buf(S.win, S.buf)
+    -- `tab = true` asks to see the preview, so :Vellum jumps to its tab; gT brings the source back
+    api.nvim_set_current_win(S.win)
+  else
+    S.win = api.nvim_open_win(S.buf, false, { split = 'right', win = from })
+  end
   local wo = vim.wo[S.win][0]
   wo.number, wo.relativenumber, wo.signcolumn, wo.foldcolumn, wo.statuscolumn = false, false, 'no', '0', ''
   wo.wrap, wo.list, wo.spell, wo.cursorline, wo.colorcolumn = false, false, false, false, ''
@@ -147,6 +167,10 @@ function M.open()
   vim.keymap.set('n', 'gx', function()
     if not M.follow() then vim.notify('vellum: no link under the cursor', vim.log.levels.INFO) end
   end, { buffer = S.buf, desc = 'Follow the link' })
+  if M.config.tab then
+    tabkeys(S.buf)
+    tabkeys(S.src)
+  end
   theme.apply()
   if image.supported and not image.problem() then browser.start() end
   -- The preview falls back to text on its own; say why, once a session.
@@ -163,8 +187,25 @@ function M.open()
   au('WinScrolled', scrolled)
   au('WinResized', resized)
   au('BufEnter', function(ev)
-    if ev.buf ~= S.src and vim.bo[ev.buf].filetype == 'markdown' then
+    if ev.buf == S.buf then
+      -- tabbing away overwrote the screen, and kitty placements do not re-anchor to text
+      -- reprinted on the way back: re-place what is on screen once this window has redrawn
+      settle:start(100, 0, vim.schedule_wrap(function()
+        if not valid() then return end
+        local again = {}
+        for _, row in pairs(S.rows) do
+          for _, m in ipairs(row) do
+            local id = m[3] and tonumber((m[3]:match('Img(%d+)')))
+            if id and image.paths[id] and not again[id] then
+              again[id] = true
+              image.resend(id)
+            end
+          end
+        end
+      end))
+    elseif ev.buf ~= S.src and vim.bo[ev.buf].filetype == 'markdown' then
       S.src = ev.buf
+      if M.config.tab then tabkeys(ev.buf) end
       update()
     end
   end)
@@ -180,6 +221,11 @@ function M.open()
     update()
   end)
   au('WinClosed', function() vim.schedule(M.close) end, { pattern = tostring(S.win) })
+  -- a forced `:bwipeout!` takes the preview buffer even while winfixbuf pins its window;
+  -- the preview must close with it, not draw onto a wiped buffer id on every edit
+  au({ 'BufUnload', 'BufWipeout' }, function(ev)
+    if ev.buf == S.buf then vim.schedule(M.close) end
+  end)
   -- A preview whose source no window shows has nothing to follow, and an
   -- unloaded source renders empty. Checked after the event, because BufEnter
   -- may have moved the preview to the markdown buffer that replaced it.
@@ -195,12 +241,21 @@ function M.open()
     local wins = vim.tbl_filter(function(w) return api.nvim_win_get_config(w).relative == '' end, api.nvim_tabpage_list_wins(0))
     if #wins == 2 and vim.tbl_contains(wins, S.win) and api.nvim_get_current_win() ~= S.win then M.close() end
   end)
-  draw()
+  -- sync reads the current window as the source; the first draw must follow the
+  -- source cursor even when the focus is already the preview window
+  api.nvim_win_call(from, draw)
 end
 
 function M.close()
   api.nvim_clear_autocmds({ group = group })
   settle:stop()
+  for _, buf in ipairs({ S.buf, S.src }) do
+    if buf and api.nvim_buf_is_valid(buf) then
+      for _, key in ipairs({ '<Tab>', 'gt', '<S-Tab>' }) do
+        pcall(vim.keymap.del, 'n', key, { buffer = buf })
+      end
+    end
+  end
   if S.win and api.nvim_win_is_valid(S.win) then pcall(api.nvim_win_close, S.win, true) end
   S = {}
 end

@@ -58,7 +58,7 @@ In the preview:
 
 - `gx` or `<CR>` on a link follows it. Web links open in your browser, `#heading` links jump to the heading, and links to other markdown files open them in the source window (the preview follows). Other files open in their default app.
 - `<CR>` on a diagram or image opens it full-screen.
-- `q` closes the preview.
+- `q` closes the preview. With `tab = true`, `Tab`/`gt`/`S-Tab` here (and in the source buffer while the preview is open) move between the two tabs.
 
 Full-screen:
 
@@ -79,6 +79,7 @@ Options (the defaults):
 require('vellum').setup({
   max_width = 100, -- widest text column in the preview
   max_pixels = nil, -- most pixels in one rendered diagram, math or non-PNG image; nil for no cap
+  tab = false,     -- true: the preview opens in its own tab, and :Vellum switches to it
 })
 ```
 

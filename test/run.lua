@@ -573,5 +573,73 @@ do
   vim.o.hidden = true
 end
 
+-- the preview in its own tab: the source keeps its own tab, the preview tab
+-- takes the focus, the tab holds nothing else, and it closes with the preview
+do
+  local vellum = require('vellum')
+  vellum.setup({ tab = true })
+  vim.cmd('silent! only | enew! | silent! %bwipeout!')
+  vim.cmd('enew')
+  vim.bo.filetype = 'markdown'
+  local src_lines = { '# Tabbed' }
+  for i = 2, 60 do
+    -- blank lines between them: without them every paragraph folds into one block,
+    -- the preview fits one screen, and a scrolled topline cannot be observed
+    src_lines[#src_lines + 1] = ''
+    src_lines[#src_lines + 1] = 'para ' .. i
+  end
+  vim.api.nvim_buf_set_lines(vim.api.nvim_get_current_buf(), 0, -1, false, src_lines)
+  local src, tab = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_tabpage()
+  vim.api.nvim_win_set_cursor(src, { #src_lines - 5, 0 })
+  local tabs = #vim.api.nvim_list_tabpages()
+  vellum.open()
+  local pages = vim.api.nvim_list_tabpages()
+  local last = pages[#pages] -- tabnew inserts after the current tab page: the preview tab page is the last one
+  local pwin = vim.api.nvim_tabpage_list_wins(last)[1]
+  local pb = vim.api.nvim_win_get_buf(pwin)
+  check('opens its own tab', #pages == tabs + 1 and #vim.api.nvim_tabpage_list_wins(last) == 1
+    and pb == vim.fn.bufnr('vellum://preview'), vim.inspect(pages))
+  check('the preview tab takes the focus', vim.api.nvim_get_current_win() == pwin
+    and vim.api.nvim_get_current_tabpage() == last and #vim.api.nvim_tabpage_list_wins(tab) == 1)
+  check('the preview fills the tab, not a split', vim.api.nvim_win_get_width(pwin) == vim.o.columns,
+    ('%d of %d columns'):format(vim.api.nvim_win_get_width(pwin), vim.o.columns))
+  check('draws there', find(vim.api.nvim_buf_get_lines(pb, 0, -1, false), 'Tabbed'))
+  -- the first draw runs with the source as the window it syncs, though the focus is this tab
+  check('open starts the preview where the source cursor is',
+    vim.api.nvim_win_call(pwin, vim.fn.winsaveview).topline > 1)
+  vim.api.nvim_set_current_win(src)
+  vim.api.nvim_win_set_cursor(src, { #src_lines - 5, 0 })
+  vellum.redraw() -- draw ends with sync: the preview must follow a cursor deep in the source
+  local top = vim.api.nvim_win_call(pwin, vim.fn.winsaveview).topline
+  check('the preview follows the source cursor across tab pages', top > 10, tostring(top))
+  vim.api.nvim_set_current_win(pwin)
+  local tab_maps = { vim.fn.maparg('<Tab>', 'n', false, true).rhs, vim.fn.maparg('gt', 'n', false, true).rhs,
+    vim.fn.maparg('<S-Tab>', 'n', false, true).rhs }
+  vim.api.nvim_set_current_win(src)
+  tab_maps[#tab_maps + 1] = vim.fn.maparg('<Tab>', 'n', false, true).rhs
+  check('Tab, gt and S-Tab move tab pages in the plugin windows',
+    tab_maps[1]:lower() == '<cmd>tabnext<cr>' and tab_maps[2]:lower() == tab_maps[1]:lower()
+    and tab_maps[3]:lower() == '<cmd>tabprevious<cr>' and tab_maps[4]:lower() == tab_maps[1]:lower(),
+    vim.inspect(tab_maps)) -- typed keys never run in this headless harness; the mapping is the plugin's contract
+  vim.cmd(pb .. 'bwipeout!') -- a forced wipeout is the one way past winfixbuf: the preview goes with its buffer
+  vim.wait(50)
+  check('preview closes when its buffer is wiped out', vim.fn.bufnr('vellum://preview') == -1
+    and #vim.api.nvim_list_tabpages() == tabs, vim.inspect(vim.api.nvim_list_tabpages()))
+  vellum.close()
+  check('close takes the preview tab with it', #vim.api.nvim_list_tabpages() == tabs and vim.fn.bufnr('vellum://preview') == -1)
+  check('close returns the Tab keys to the source buffer', vim.fn.maparg('<Tab>', 'n') == '',
+    vim.inspect(vim.fn.maparg('<Tab>', 'n', false, true)))
+  -- a tab page with no source window left has nothing to preview
+  vim.api.nvim_buf_set_lines(vim.api.nvim_win_get_buf(src), 0, -1, false, { '# Tabbed' })
+  vellum.open()
+  vim.cmd('tabnew | enew') -- so closing the source tab page is not closing the last one
+  vim.api.nvim_set_current_win(src)
+  vim.cmd('tabclose!') -- the source buffer is modified, so only a discarding close gets there
+  vim.wait(50)
+  check('the preview closes with its source tab', vim.fn.bufnr('vellum://preview') == -1
+    and #vim.api.nvim_list_tabpages() == tabs, vim.inspect(vim.api.nvim_list_tabpages()))
+  vellum.setup({ tab = false })
+end
+
 print(('%d checks, %d failed'):format(count, failed))
 vim.cmd(failed == 0 and 'qa!' or 'cq!')
