@@ -2,13 +2,13 @@
 
 ## Where things stand
 
-Working plugin, public at github.com/blackhat-7/vellum.nvim, released as v0.2.0. `:Vellum` opens the preview (`setup({ tab = true })`: its own tab, which `:Vellum` switches to; Tab/gt/S-Tab move tab pages in its two windows, and images re-place when the tab comes back); it re-renders on every edit and follows the cursor; scrolling the preview scrolls the source. `<CR>` on an image in the preview opens it full-screen (`zoom.lua`); `gx`/`<CR>` on a link follows it (`links.lua`). `:Vellum export` writes PDF or HTML (renderer + `marked`). `:checkhealth vellum` (`health.lua`) renders a test diagram and says why images can't show. Obsidian callouts, `==highlight==` and `[[wikilinks]]` render. Keystroke cost: 0.23 ms for a README, ~6.8 ms median at 5,000 lines (`test/perf.lua`). Rendered: headings, paragraphs with bold/italic/strike/code/links/bare URLs/escapes/entities, lists, quotes, GitHub alerts, footnotes, tables, code with syntax colors, front matter, HTML blocks, `<details>` summaries (`▾`), images (block, or inline one row high for badges), mermaid diagrams, math.
+Working plugin, public at github.com/blackhat-7/vellum.nvim, released as v0.2.0. `:Vellum` opens the preview (`setup({ tab = true })`: its own tab, which `:Vellum` switches to; Tab/gt/S-Tab move tab pages in its two windows, and images re-place when the tab comes back); it re-renders on every edit and follows the cursor; scrolling the preview scrolls the source. `<CR>` on an image in the preview opens it full-screen (`zoom.lua`); `gx`/`<CR>` on a link follows it (`links.lua`). `:Vellum export` writes PDF or HTML (renderer + `marked`). `:checkhealth vellum` (`health.lua`) renders a test diagram and says why images can't show; kitty, Ghostty and herdr count as image terminals (herdr needs `terminal.kitty_graphics`, on by default). Obsidian callouts, `==highlight==` and `[[wikilinks]]` render. Keystroke cost: 0.23 ms for a README, ~6.8 ms median at 5,000 lines (`test/perf.lua`). Rendered: headings, paragraphs with bold/italic/strike/code/links/bare URLs/escapes/entities, lists, quotes, GitHub alerts, footnotes, tables, code with syntax colors, front matter, HTML blocks, `<details>` summaries (`▾`), images (block, or inline one row high for badges), mermaid diagrams, math.
 
 Math: inline `$…$` becomes Unicode text (`latex.lua`); `$$…$$` and ```` ```math ```` become KaTeX pictures through the same headless browser as mermaid, with the text form while rendering or without kitty graphics. `$5 and $10` stays text.
 
 Rendering is split by job: `render.lua` (blocks), `inline.lua` (inline text, wrap), `code.lua` (code panels, diagrams), `media.lua` (images), `latex.lua` (math). The renderer starts on `:Vellum`; the PNG cache is capped at 100 MB.
 
-Resizing the pane stays smooth. The renderer restarts after a crash. `nvim --clean -l test/run.lua`: 160 checks green.
+Resizing the pane stays smooth. The renderer restarts after a crash. `nvim --clean -l test/run.lua`: 162 checks green.
 
 ## What's next
 
@@ -38,3 +38,4 @@ Candidates: vimdoc + CI; WezTerm once its placeholder PR (wezterm#7924) ships; G
 - **Kitty ignores the source rectangle (`x,y,w,h`) on placeholder placements.** The zoom viewer crops by naming cells instead, so zoom stops where the image reaches 297 cells on a side.
 - **tmux can drop a kitty placement command under a burst of redraws** (fast wheel zoom). The text is right but the picture keeps an old size. The zoom viewer re-sends its placement 100 ms after the last event.
 - **herdr drops kitty images above about 5.9 MP without a word.** `max_pixels = 5.5e6` lowers big renders' scale under it. Chrome's screenshots carry no pHYs; the renderer adds one with the scale, read by `image.png_density()`.
+- **herdr panes report `TERM_PROGRAM=herdr` and `TERM=xterm-256color`; they do not inherit `KITTY_WINDOW_ID` or `GHOSTTY_RESOURCES_DIR`.** Detect herdr by its own variables, not the outer terminal.

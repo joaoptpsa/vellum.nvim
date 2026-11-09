@@ -360,6 +360,28 @@ do
   check('termguicolors on', image.problem() == nil or image.problem():find('tmux'))
 end
 
+-- herdr parses kitty graphics itself and names its panes, so the outer
+-- terminal's variables never reach the pane
+do
+  local keys = { 'TERM', 'TERM_PROGRAM', 'HERDR_ENV', 'KITTY_WINDOW_ID', 'GHOSTTY_RESOURCES_DIR', 'TMUX' }
+  local saved = {}
+  for _, key in ipairs(keys) do
+    saved[key] = vim.env[key]
+    vim.env[key] = nil
+  end
+  local ui_send = vim.api.nvim_ui_send
+  vim.api.nvim_ui_send = ui_send or function() end
+  vim.env.TERM, vim.env.TERM_PROGRAM, vim.env.HERDR_ENV = 'xterm-256color', 'herdr', '1'
+  image.detect()
+  check('herdr can show images', image.supported)
+  vim.env.TERM_PROGRAM, vim.env.HERDR_ENV = 'xterm-256color', nil
+  image.detect()
+  check('a plain terminal cannot', not image.supported)
+  for _, key in ipairs(keys) do vim.env[key] = saved[key] end
+  vim.api.nvim_ui_send = ui_send
+  image.detect()
+end
+
 -- image placeholders are exactly cols wide
 do
   local lines = image.lines('/nonexistent.png', 7, 3)

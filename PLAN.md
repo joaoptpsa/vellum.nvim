@@ -30,3 +30,4 @@ Each line carries its own done-check.
 - [x] Obsidian: callouts, `==highlight==`, `[[wikilinks]]`. Done: checks + kitty look; 600-file sweep unchanged vs main.
 - [x] `:Vellum export [file.pdf|file.html]`. Done: showcase + edge-case docs exported and checked page by page.
 - [x] Setting to open the preview in a new tab, not side by side. Done: `nvim --clean -l test/run.lua` green; the preview fills its own tab and takes the focus, `q` closes it with the tab, and it closes with its source.
+- [x] herdr counts as an image terminal, so its diagrams no longer fall back to code. Done: headless detection test, and a diagram seen in a real herdr pane.

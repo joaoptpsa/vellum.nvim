@@ -24,11 +24,15 @@ local function images()
   local image = require('vellum.image')
   if not image.supported then
     h.warn("this terminal can't show images, so diagrams show as code and images as their alt text",
-      { 'Use kitty or Ghostty. In tmux, vellum asks tmux which terminal is attached.' })
+      { 'Use kitty, Ghostty, or herdr with an outer terminal that supports kitty graphics.',
+        'In tmux, vellum asks tmux which terminal is attached.' })
   elseif image.problem() then
     h.warn(image.problem())
   else
-    h.ok('images show in this terminal')
+    h.ok('this terminal supports kitty images')
+    if vim.env.HERDR_ENV == '1' or vim.env.TERM_PROGRAM == 'herdr' then
+      h.info('herdr forwards images when terminal.kitty_graphics is on (the default) and the outer terminal supports them')
+    end
   end
 end
 

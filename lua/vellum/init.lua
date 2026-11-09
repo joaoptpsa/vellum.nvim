@@ -174,7 +174,7 @@ function M.open()
   theme.apply()
   if image.supported and not image.problem() then browser.start() end
   -- The preview falls back to text on its own; say why, once a session.
-  local why = not image.supported and "this terminal can't show images (kitty and Ghostty can), so diagrams show as code"
+  local why = not image.supported and "this terminal can't show images (kitty, Ghostty and herdr can), so diagrams show as code"
     or image.problem()
   if why and not warned then
     warned = true

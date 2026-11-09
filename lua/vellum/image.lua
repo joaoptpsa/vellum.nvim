@@ -39,7 +39,9 @@ M.max_cells = #DIACRITICS -- per row and per column
 -- over ssh, where env vars lie) tmux reports the attached terminal. A
 -- placeholder's color *is* its image id, so without 24-bit color (tmux's RGB
 -- feature, 'termguicolors') images silently vanish; tmux also drops the
--- image data unless allow-passthrough is on.
+-- image data unless allow-passthrough is on. herdr parses kitty graphics and
+-- Unicode placeholders itself, and names its panes instead of the terminal
+-- behind them.
 local function tmux(args)
   local ok, r = pcall(function() return vim.system(vim.list_extend({ 'tmux' }, args), { text = true }):wait() end)
   return ok and r.code == 0 and vim.trim(r.stdout) or ''
@@ -47,13 +49,14 @@ end
 
 local tmux_problem
 
-local function detect()
+function M.detect()
   local env = (vim.env.TERM or '') .. (vim.env.TERM_PROGRAM or '')
-  local local_term = vim.env.KITTY_WINDOW_ID or vim.env.GHOSTTY_RESOURCES_DIR or env:find('kitty') or env:find('ghostty')
+  local herdr = vim.env.HERDR_ENV == '1' or env:find('herdr') ~= nil
+  local known_term = vim.env.KITTY_WINDOW_ID or vim.env.GHOSTTY_RESOURCES_DIR or env:find('kitty') or env:find('ghostty') or herdr
   local client = vim.env.TMUX and tmux({ 'display', '-p', '#{client_termtype}\t#{client_termfeatures}\t#{client_termname}' }) or ''
   local kind, features, name = unpack(vim.split(client, '\t'))
   M.supported = vim.api.nvim_ui_send ~= nil
-    and (local_term or (kind or ''):lower():find('kitty') or (kind or ''):lower():find('ghostty')) ~= nil
+    and (known_term or (kind or ''):lower():find('kitty') or (kind or ''):lower():find('ghostty')) ~= nil
   tmux_problem = nil
   if not M.supported or not vim.env.TMUX then return end
   if features and not features:find('RGB') then
@@ -62,7 +65,7 @@ local function detect()
     tmux_problem = "tmux blocks the image data. Add to tmux.conf:\nset -g allow-passthrough on\nthen run: tmux source-file ~/.tmux.conf"
   end
 end
-detect()
+M.detect()
 
 -- Why a supported terminal still cannot show images, or nil. 'termguicolors'
 -- is read each time: Neovim may switch it on after startup.
@@ -85,7 +88,7 @@ end
 -- re-attaches from another terminal.
 function M.reset()
   sent = {}
-  detect()
+  M.detect()
 end
 
 -- Send the PNG bytes themselves, not a path: over ssh the terminal is on

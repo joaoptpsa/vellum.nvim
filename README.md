@@ -24,7 +24,8 @@ Colors follow your colorscheme, light or dark, diagrams included:
 
 - Neovim ≥ 0.12 with `termguicolors`
 - Node.js ≥ 20 (for mermaid diagrams and non-PNG images)
-- For images: [kitty](https://sw.kovidgoyal.net/kitty/) or [Ghostty](https://ghostty.org). Works over ssh. In tmux, add:
+- For images: [kitty](https://sw.kovidgoyal.net/kitty/), [Ghostty](https://ghostty.org), or herdr 0.6+ with
+  `terminal.kitty_graphics` on (the default). Works over ssh. In tmux, add:
   ```tmux
   set -g allow-passthrough on
   set -as terminal-features ',xterm-256color:RGB'   # your outer $TERM; ssh drops COLORTERM
@@ -46,7 +47,7 @@ With [lazy.nvim](https://github.com/folke/lazy.nvim):
 
 lazy runs `build.lua` on install. It installs the diagram renderer: `npm ci` and a small headless Chrome download.
 
-If diagrams don't show, run `:checkhealth vellum`. It checks Node, renders a test diagram, and says what your terminal or tmux setup is missing.
+If diagrams don't show, run `:checkhealth vellum`. It checks Node, renders a test diagram, and says what your terminal, herdr or tmux setup is missing.
 
 ## Use
 
@@ -100,7 +101,7 @@ scale instead. They keep their size in the preview but look softer when zoomed.
 | Obsidian callouts (`> [!question]- Title`), `==highlight==`, `[[wikilinks]]` | callout colors and titles, marked text, links you can follow |
 | Tables | aligned, wrapped to fit, zebra rows |
 | Fenced code | tree-sitter syntax colors, language label |
-| ` ```mermaid ` | image (text fallback outside kitty/Ghostty) |
+| ` ```mermaid ` | image (text fallback outside kitty/Ghostty/herdr) |
 | Footnotes | superscript refs, muted notes |
 | Math: `$…$`, `$$…$$`, ` ```math ` | inline as Unicode text (`x²`, `α ≤ β`); display math as a KaTeX image (Unicode text elsewhere) |
 | Images: PNG, JPG, GIF, WebP, SVG, local or http(s) | image (alt text elsewhere) |
