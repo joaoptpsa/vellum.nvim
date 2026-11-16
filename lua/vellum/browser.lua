@@ -1,5 +1,5 @@
 -- Bridge to render/browser.mjs: one long-lived headless browser turns mermaid
--- diagrams, display math and non-PNG images into PNGs, cached on disk by content hash.
+-- and D2 diagrams, display math and non-PNG images into PNGs, cached on disk by content hash.
 local image = require('vellum.image')
 
 local M = {}
@@ -10,6 +10,7 @@ local job, pending, errors, sizes, wanted = nil, {}, {}, {}, {} -- pending: out 
 local exports = {} -- out → function(error) to call when the export is done
 
 M.on_update = function() end
+M.waiting = 0 -- counts every answer 'pending': output showing one must not be cached
 M.max_pixels = nil -- most pixels in one rendered PNG, from setup(); nil for no cap
 
 -- Keep the cache under 100 MB, least recently used out first. Runs once per
@@ -34,16 +35,41 @@ prune()
 
 local send -- below; a restarted renderer resends through it
 
--- Start the renderer, if it is not running. Loading Chrome and mermaid takes
--- ~0.7 s, so the preview starts it on open rather than on the first diagram.
--- Returns an error message, or nil.
+-- Chrome holds 100-200 MB, so it runs only while there is work: it stops
+-- after five minutes with nothing to render, and the next uncached picture
+-- starts it again (~0.6 s). Five minutes: pauses while editing stay warm.
+M.idle_ms = 300000
+local idle = vim.uv.new_timer()
+
+local function idle_now() return job and not next(pending) and not next(exports) end
+
+-- checked again when the timer fires: a request may have come in since
+local stop_if_idle = vim.schedule_wrap(function()
+  if not idle_now() then return end
+  job:write(nil) -- closing stdin makes browser.mjs close Chrome and exit
+  job = nil -- so the exit callback below does not take it for a crash
+end)
+
+local function stop_when_idle()
+  if idle_now() then idle:start(M.idle_ms, 0, stop_if_idle) end
+end
+
+-- True while a picture is being rendered.
+function M.busy() return next(pending) ~= nil end
+
+-- Start the renderer, if it is not running. Returns an error message, or nil.
 function M.start()
+  idle:stop()
   if job then return end
   if vim.fn.executable('node') == 0 then return 'node not found: diagrams need Node.js 20.6 or newer' end
-  if not vim.uv.fs_stat(root .. '/node_modules') then return 'renderer not built: run :Lazy build vellum.nvim' end
+  if not vim.uv.fs_stat(root .. '/node_modules') then return 'renderer not built: run :Vellum build' end
   vim.fn.mkdir(dir, 'p')
   local partial, stderr, answered = '', '', false
-  local ok, proc = pcall(vim.system, { 'node', root .. '/browser.mjs' }, {
+  local ok, proc -- declared first: the exit callback compares it with job
+  ok, proc = pcall(vim.system, { 'node', root .. '/browser.mjs' }, {
+    -- puppeteer reads its config (.puppeteerrc.*) from the working directory:
+    -- render/.puppeteerrc.cjs applies (Nix names its browser there), a user's project one does not
+    cwd = root,
     stdin = true,
     stdout = function(_, data)
       partial = partial .. (data or '')
@@ -65,11 +91,13 @@ function M.start()
             end
           end
         end
+        stop_when_idle()
       end)
     end,
     stderr = function(_, data) stderr = (stderr .. (data or '')):sub(-500) end,
   }, function()
     vim.schedule(function()
+      if job ~= proc then return end -- stopped on purpose
       job = nil
       for _, finished in pairs(exports) do finished('renderer stopped') end
       exports = {}
@@ -96,11 +124,12 @@ function send(out, req)
   local err = M.start()
   if err then return err end
   pending[out] = req
+  req.since = req.since or vim.uv.now()
   req.out = out
   job:write(vim.json.encode(req) .. '\n')
 end
 
--- 'ready', path, { w, h, density } | 'error', message | 'pending'
+-- 'ready', path, { w, h, density } | 'error', message | 'pending', ms since sent
 -- density is PNG pixels per CSS px.
 local function request(key, payload)
   if M.max_pixels then
@@ -111,10 +140,10 @@ local function request(key, payload)
   local out = dir .. '/' .. vim.fn.sha256(key):sub(1, 32) .. '.png'
   if errors[out] then return 'error', errors[out] end
   if not sizes[out] then
-    local w, h = image.png_size(out)
+    local w, h, density = image.png_size(out)
     if w then
       -- PNGs from before the renderer wrote pHYs are all 2x
-      sizes[out] = { w, h, image.png_density(out) or 2 }
+      sizes[out] = { w, h, density or 2 }
       vim.uv.fs_utime(out, os.time(), os.time())
     end
   end
@@ -124,7 +153,8 @@ local function request(key, payload)
     if err then return 'error', err end
   end
   wanted[out] = true
-  return 'pending'
+  M.waiting = M.waiting + 1
+  return 'pending', vim.uv.now() - pending[out].since
 end
 
 -- Cancel queued renders the last draw did not ask for. Typing inside a
@@ -137,20 +167,62 @@ function M.drop_stale()
     end
   end
   wanted = {}
+  stop_when_idle()
 end
 
 -- Write req.markdown, whose relative links resolve in req.dir, to req.out: a
--- .pdf or .html file. req.kinds maps callout types to colors. Calls
+-- .pdf or .html file, drawing D2 as diagrams do. req.kinds maps callout types to colors. Calls
 -- done(error) when finished; error is nil on success.
 function M.export(req, done)
   if exports[req.out] then return done('already exporting to ' .. req.out) end
   local err = M.start()
   if err then return done(err) end
   exports[req.out] = done
+  local d2 = M.d2_command()
+  req.d2bin = d2 and d2.bin
   job:write(vim.json.encode(req) .. '\n')
 end
 
-function M.diagram(code, theme)
+-- Local D2 icon files are part of the picture, so their versions are part of
+-- its key: an edited icon renders anew, like an edited image (media.lua).
+local function icon_versions(code, dir)
+  local out = {}
+  for line in code:gmatch('[^\n]+') do
+    for value in line:gmatch('icon%s*:%s*([^;}]+)') do
+      local path = vim.trim(value):gsub('^(["\'])(.*)%1$', '%2')
+      if not path:match('^%a[%w+.-]*:') then -- a URL is fetched as it is
+        local stat = vim.uv.fs_stat(vim.fs.joinpath(dir, path))
+        out[#out + 1] = path .. '\0' .. (stat and stat.mtime.sec .. '.' .. stat.size or '')
+      end
+    end
+  end
+  return table.concat(out, '\0')
+end
+
+-- The user's d2 command, { bin, version }, or nil; looked up once. D2 renders
+-- with it when installed (newer than the bundled D2, with the user's layout
+-- plugins such as TALA), else with the bundled one.
+local d2_found
+function M.d2_command()
+  if d2_found == nil then
+    local bin = vim.fn.exepath('d2')
+    local r = bin ~= '' and vim.system({ bin, '--version' }, { text = true }):wait()
+    d2_found = r and r.code == 0 and { bin = bin, version = vim.trim(r.stdout) } or false
+  end
+  return d2_found or nil
+end
+
+-- A diagram in `lang`, 'mermaid' or 'd2', in the colorscheme's colors. D2's
+-- local icons resolve in `dir`, the markdown file's folder.
+function M.diagram(code, theme, lang, dir)
+  if lang == 'd2' then
+    dir = dir or vim.fn.getcwd()
+    local d2 = M.d2_command()
+    -- which d2 draws it is part of the picture: installing or upgrading one renders anew
+    local by = d2 and d2.bin .. ' ' .. d2.version or 'bundled'
+    local key = table.concat({ 'd2', by, theme.d2_signature, dir, icon_versions(code, dir), code }, '\0')
+    return request(key, { d2 = code, theme = theme.d2, dir = dir, bin = d2 and d2.bin })
+  end
   return request(theme.signature .. code, { code = code, theme = theme.mermaid })
 end
 

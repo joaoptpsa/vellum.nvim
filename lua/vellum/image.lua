@@ -33,6 +33,7 @@ local DIACRITICS = {
 }
 
 local PLACEHOLDER = vim.fn.nr2char(0x10EEEE)
+M.placeholder = PLACEHOLDER
 M.max_cells = #DIACRITICS -- per row and per column
 
 -- Which terminal draws the images, and whether it can. Inside tmux (often
@@ -55,8 +56,9 @@ function M.detect()
   local known_term = vim.env.KITTY_WINDOW_ID or vim.env.GHOSTTY_RESOURCES_DIR or env:find('kitty') or env:find('ghostty') or herdr
   local client = vim.env.TMUX and tmux({ 'display', '-p', '#{client_termtype}\t#{client_termfeatures}\t#{client_termname}' }) or ''
   local kind, features, name = unpack(vim.split(client, '\t'))
+  local attached = (kind or ''):lower()
   M.supported = vim.api.nvim_ui_send ~= nil
-    and (known_term or (kind or ''):lower():find('kitty') or (kind or ''):lower():find('ghostty')) ~= nil
+    and (known_term or attached:find('kitty') or attached:find('ghostty')) ~= nil
   tmux_problem = nil
   if not M.supported or not vim.env.TMUX then return end
   if features and not features:find('RGB') then
@@ -129,27 +131,21 @@ local function u32(s, i)
   return ((a * 256 + b) * 256 + c) * 256 + d
 end
 
--- Width and height of a PNG file, or nil when it is missing.
+-- Width and height of a PNG file, or nil when it is missing; third, its image
+-- pixels per CSS px, from a pHYs chunk right after the IHDR where the renderer
+-- writes it, or nil when it has none there.
 function M.png_size(path)
-  local f = io.open(path, 'rb')
-  if not f then return nil end
-  local h = f:read(24)
-  f:close()
-  if not h or #h < 24 or h:sub(2, 4) ~= 'PNG' then return nil end
-  return u32(h, 17), u32(h, 21)
-end
-
--- Image pixels per CSS px, from a pHYs chunk right after the IHDR, where the
--- renderer writes it; nil when the PNG has none there.
-function M.png_density(path)
   local f = io.open(path, 'rb')
   if not f then return nil end
   local h = f:read(50)
   f:close()
-  if not h or #h < 50 or h:sub(38, 41) ~= 'pHYs' or h:byte(50) ~= 1 then return nil end
-  -- pixels per metre at CSS's 96 px per inch, rounded so a 2x PNG reads as 2
-  local density = u32(h, 42) * 0.0254 / 96
-  return math.floor(density * 1000 + 0.5) / 1000
+  if not h or #h < 24 or h:sub(2, 4) ~= 'PNG' then return nil end
+  local density
+  if #h == 50 and h:sub(38, 41) == 'pHYs' and h:byte(50) == 1 then
+    -- pixels per metre at CSS's 96 px per inch, rounded so a 2x PNG reads as 2
+    density = math.floor(u32(h, 42) * 0.0254 / 96 * 1000 + 0.5) / 1000
+  end
+  return u32(h, 17), u32(h, 21), density
 end
 
 M.paths = {} -- image id -> PNG path, to find the file behind a placeholder
@@ -160,17 +156,19 @@ function M.id(key)
   return id == 0 and 1 or id
 end
 
--- Placeholder lines showing rows r0..r0+nr-1 and columns c0..c0+nc-1 (from 0)
--- of `path` placed in a cols x rows box as image `id`, as segment lines.
-function M.grid(id, path, cols, rows, r0, c0, nr, nc)
+-- The id of the image behind highlight group `group` (made by grid), or nil.
+function M.id_of(group)
+  local id = tonumber((group:match('Img(%d+)')))
+  return M.paths[id] and id
+end
+
+-- Placeholder text for rows r0..r0+nr-1 and columns c0..c0+nc-1 (from 0)
+-- of image `id`, as segment lines. The terminal shows nothing until the
+-- image itself is sent (ensure).
+local function cells(id, path, r0, c0, nr, nc)
   local hl = 'VellumImg' .. id
   vim.api.nvim_set_hl(0, hl, { fg = id })
   M.paths[id] = path
-  local size = cols .. 'x' .. rows
-  if sent[id] ~= size then
-    if sent[id] then place(id, cols, rows) else transmit(id, cols, rows, path) end
-    sent[id] = size
-  end
   -- only a row's first cell names its row and column; kitty gives each
   -- bare cell after it the next column. Full marks on every cell more than
   -- doubled the bytes of every redraw, which lags over ssh.
@@ -182,8 +180,80 @@ function M.grid(id, path, cols, rows, r0, c0, nr, nc)
   return out
 end
 
+-- Make the terminal hold image `id` placed in a cols x rows box.
+local function ensure(id, path, cols, rows)
+  local size = cols .. 'x' .. rows
+  if sent[id] == size then return end
+  if sent[id] then place(id, cols, rows) else transmit(id, cols, rows, path) end
+  sent[id] = size
+end
+
+-- The zoom viewer's lines: its image is sent at once.
+function M.grid(id, path, cols, rows, r0, c0, nr, nc)
+  ensure(id, path, cols, rows)
+  return cells(id, path, r0, c0, nr, nc)
+end
+
+-- The preview's images: sent when a row of theirs is first drawn (show),
+-- and freed when the document drops them (keep) or the budget needs room.
+-- Sending every image at render time filled the terminal's image memory
+-- (kitty: 320 MB) with pictures far off screen, and it evicted the oldest
+-- ones, so they showed as blank space.
+local BUDGET = 160e6 -- decoded bytes; leaves the zoom viewer room under kitty's 320 MB
+local owned = {} -- id → { path, cols, rows, bytes, frame last drawn }
+local frame = 0
+
 -- Placeholder lines showing `path` in a cols x rows box, as segment lines.
-function M.lines(path, cols, rows) return M.grid(M.id(path), path, cols, rows, 0, 0, rows, cols) end
+function M.lines(path, cols, rows)
+  local id = M.id(path)
+  local o = owned[id] or { path = path }
+  if not o.bytes then
+    local pw, ph = M.png_size(path)
+    o.bytes = (pw or 0) * (ph or 0) * 4
+  end
+  o.cols, o.rows = cols, rows
+  owned[id] = o
+  return cells(id, path, 0, 0, rows, cols)
+end
+
+-- A new redraw of the preview starts: images drawn in it count as on screen.
+function M.next_frame() frame = frame + 1 end
+
+-- A row of image `id` is being drawn: send it if the terminal lacks it,
+-- first freeing images not on screen, least recently drawn first.
+function M.show(id)
+  local o = owned[id]
+  if not o then return end
+  o.frame = frame
+  if sent[id] == o.cols .. 'x' .. o.rows then return end
+  if not sent[id] then
+    local total = o.bytes
+    for other, x in pairs(owned) do
+      if sent[other] then total = total + x.bytes end
+    end
+    while total > BUDGET do
+      local oldest
+      for other, x in pairs(owned) do
+        if sent[other] and x.frame ~= frame and (not oldest or x.frame < owned[oldest].frame) then oldest = other end
+      end
+      if not oldest then break end
+      total = total - owned[oldest].bytes
+      M.drop(oldest)
+    end
+  end
+  ensure(id, o.path, o.cols, o.rows)
+end
+
+-- Free the preview's images that `shown` (id → true) no longer has: every
+-- version of an edited diagram is a new image.
+function M.keep(shown)
+  for id in pairs(owned) do
+    if not shown[id] then
+      M.drop(id)
+      owned[id] = nil
+    end
+  end
+end
 
 -- Send image `id`'s current placement again. Under a burst of redraws tmux
 -- can drop one, leaving the picture at an old size over the new text.

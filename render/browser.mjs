@@ -1,11 +1,15 @@
 // Headless-browser PNG renderer. Reads one JSON request per stdin line:
 //   {"out": "/abs/file.png", "code": "...", "theme": {...}}   a mermaid diagram
+//   {"out": "/abs/file.png", "d2": "...", "theme": {...}, "dir": "/abs/dir", "bin": "/abs/d2"}   a D2 diagram; local icons
+//     resolve in dir; bin, the user's d2 command, renders it when given
 //   {"out": "/abs/file.png", "image": "/abs/path or https://..."}   any image the browser can show
 //   {"out": "/abs/file.png", "math": "\\frac{a}{b}", "color": "#rrggbb"}   display math, by KaTeX
-//   {"out": "/abs/doc.pdf" or ".html", "markdown": "...", "dir": "/abs/dir", "kinds": {...}}   a document export
-// and answers one JSON line: {"out"} when the PNG is written, or {"out", "error"}.
+//   {"out": "/abs/doc.pdf" or ".html", "markdown": "...", "dir": "/abs/dir", "kinds": {...}, "d2bin": "/abs/d2"}   a document export
+// Each picture request may carry "maxPixels", a cap on the PNG's pixels.
+// It answers one JSON line: {"out"} when the PNG is written, or {"out", "error"}.
 // A real browser renders exactly what GitHub renders; a fake DOM mis-measures
 // text and breaks class and gantt diagrams.
+import { spawn } from 'node:child_process';
 import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, extname, join, resolve } from 'node:path';
@@ -16,10 +20,14 @@ import puppeteer from 'puppeteer';
 const SCALE = 2; // device pixels per CSS px; kitty downsamples, so text stays crisp
 const VIEWPORT = { width: 800, height: 800 };
 const MIME = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp', '.avif': 'image/avif' };
+const dataUrl = (file) => `data:${MIME[extname(file).toLowerCase()] ?? 'application/octet-stream'};base64,${readFileSync(file).toString('base64')}`;
+const MERMAID = fileURLToPath(import.meta.resolve('mermaid/dist/mermaid.min.js'));
 
-const browser = await puppeteer.launch({ headless: 'shell', args: ['--no-sandbox'] }).catch((e) => {
+// No font hinting: on Linux it rounds every glyph's advance to whole pixels,
+// so text came out wider than D2 laid it out (code overflowed its boxes)
+const browser = await puppeteer.launch({ headless: 'shell', args: ['--no-sandbox', '--font-render-hinting=none'] }).catch((e) => {
   // one short last line: the plugin shows it in place of each diagram
-  console.error('cannot start the browser (run :Lazy build vellum.nvim): ' + String(e.message).split('\n')[0]);
+  console.error('cannot start the browser (run :Vellum build): ' + String(e.message).split('\n')[0]);
   process.exit(1);
 });
 // without Chrome every render would fail; exiting lets the plugin start a new one
@@ -28,7 +36,7 @@ const page = await browser.newPage();
 await page.setViewport({ ...VIEWPORT, deviceScaleFactor: SCALE });
 await page.setContent(`<!DOCTYPE html><body style="margin:0;background:transparent">
   <div id="c" style="display:inline-block;padding:12px"></div></body>`);
-await page.addScriptTag({ path: fileURLToPath(import.meta.resolve('mermaid/dist/mermaid.min.js')) });
+await page.addScriptTag({ path: MERMAID });
 await page.addScriptTag({ path: fileURLToPath(import.meta.resolve('katex/dist/katex.min.js')) });
 // KaTeX's fonts inlined: an about:blank page cannot fetch its relative font URLs
 const katexDir = dirname(fileURLToPath(import.meta.resolve('katex/dist/katex.min.css')));
@@ -87,10 +95,104 @@ const diagram = ({ code, theme }) => page.evaluate(async (code, id, theme) => {
   }
 }, code, 'm' + n++, theme ?? {});
 
+// D2 compiles to SVG in node (WebAssembly) and loads on the first D2 diagram,
+// so documents without one pay nothing and an older build still draws mermaid.
+// `theme` is { themeID, themeOverrides }; without it, D2's own light theme (exports).
+// `bin` is the user's d2 command, if any: it renders then, else the bundled D2.
+// Local icon paths resolve in `dir`.
+let d2;
+async function d2svg(code, theme, dir, bin) {
+  d2 ??= await import('@terrastruct/d2').then((m) => new m.D2(), (e) => {
+    throw new Error('D2 needs a rebuilt renderer (:Vellum build): ' + e.message);
+  });
+  const r = await d2.compile(code).catch((e) => {
+    // newer syntax than the bundled D2 knows: the d2 command may still take it
+    if (bin) return null;
+    // compile errors arrive as JSON: [{"errmsg": "index:3:5: ..."}], index being the source
+    let list;
+    try { list = JSON.parse(e.message); } catch { throw e; }
+    throw new Error(list.map((x) => x.errmsg.replace(/^index:/, 'line ')).join('\n'));
+  });
+  // the diagram's own d2-config wins: its padding, theme or theme-overrides.
+  // The padding is the margin mermaid gets from #c; at 0, shapes on the edge
+  // lose the outer half of their border
+  const own = r?.diagram.config ?? {};
+  const themed = theme && r && !own.themeID && !r.renderOptions.themeOverrides;
+  if (bin) {
+    // d2's flags would override the diagram's own d2-config, so ours go in as
+    // d2-config after the code, for what it leaves unset; last keeps line numbers
+    const config = {};
+    if (r && own.pad == null) config.pad = 12;
+    if (themed) Object.assign(config, { 'theme-id': theme.themeID, 'theme-overrides': theme.themeOverrides });
+    return sized(await d2command(bin, Object.keys(config).length ? `${code}\nvars: { d2-config: ${d2map(config)} }\n` : code, dir));
+  }
+  const options = { ...r.renderOptions, pad: own.pad ?? 12, noXMLTag: true };
+  if (themed) Object.assign(options, theme);
+  for (const shape of r.diagram.shapes) {
+    const icon = shape.icon; // a Go url.URL; data: URLs keep their payload in Opaque
+    if (!icon || icon.Scheme || !dir) continue;
+    const file = resolve(dir, icon.Path);
+    let data;
+    try { data = dataUrl(file); } catch { continue; } // missing: an empty icon, as D2 shows it
+    shape.icon = { ...icon, Scheme: 'data', Opaque: data.slice('data:'.length), Path: '', RawPath: '' };
+  }
+  return sized(await d2.render(r.diagram, options));
+}
+
+// D2's root svg has only a viewBox; unsized, it collapses in a shrink-wrapped box
+function sized(svg) {
+  const [, , w, h] = /viewBox="([^"]+)"/.exec(svg)[1].split(/[\s,]+/);
+  return svg.replace('<svg ', `<svg width="${w}" height="${h}" `);
+}
+
+// An object as a D2 map: { pad: 12; theme-overrides: { N1: "#000000" } }
+const d2map = (o) => `{ ${Object.entries(o).map(([k, v]) => `${k}: ${typeof v === 'object' ? d2map(v) : JSON.stringify(v)}`).join('; ')} }`;
+
+// D2 source → SVG with the d2 command, in `dir` so relative icons resolve; it
+// bundles icons into the SVG. Its errors read "err: failed to compile -: -:3:5: ...".
+function d2command(bin, source, dir) {
+  return new Promise((done, fail) => {
+    const p = spawn(bin, ['--no-xml-tag', '-', '-'], { cwd: dir, timeout: 30000 });
+    const out = [], err = [];
+    p.stdout.on('data', (b) => out.push(b));
+    p.stderr.on('data', (b) => err.push(b));
+    p.on('error', fail);
+    p.on('close', (code, signal) => {
+      if (code === 0) return done(Buffer.concat(out).toString());
+      const lines = Buffer.concat(err).toString().split('\n').filter((l) => l.startsWith('err: '));
+      fail(new Error(signal ? 'd2 took longer than 30 s'
+        : lines.map((l) => l.slice(5).replace(/^failed to compile -: -:/, 'line ')).join('\n') || `d2 exited with ${code}`));
+    });
+    p.stdin.end(source);
+  });
+}
+
+const d2diagram = async ({ d2: code, theme, dir, bin }) => {
+  let svg;
+  try {
+    svg = await d2svg(code, theme, dir, bin);
+  } catch (e) {
+    return String(e?.message ?? e).slice(0, 600);
+  }
+  return page.evaluate(async (svg) => {
+    const c = document.getElementById('c');
+    c.innerHTML = svg;
+    // icons load after the svg is in; listening in this same task misses none.
+    // One that fails or hangs leaves its space empty, the diagram still shows
+    const icons = [...c.querySelectorAll('image')].map((i) => new Promise((done) => {
+      i.addEventListener('load', done);
+      i.addEventListener('error', done);
+      setTimeout(done, 10000);
+    }));
+    await Promise.all(icons);
+    await document.fonts.ready; // D2 embeds its fonts; a shot before they load shows fallback glyphs
+    return null;
+  }, svg);
+};
+
 const picture = ({ image }) => {
   // local files go in as data URLs: an about:blank page may not read file://
-  const src = /^https?:\/\//.test(image) ? image
-    : `data:${MIME[extname(image).toLowerCase()] ?? 'application/octet-stream'};base64,${readFileSync(image).toString('base64')}`;
+  const src = /^https?:\/\//.test(image) ? image : dataUrl(image);
   return page.evaluate(async (src) => {
     const c = document.getElementById('c');
     c.innerHTML = '';
@@ -178,14 +280,15 @@ blockquote.alert { color: inherit; }
 .warning { border-color: #9a6700; } .warning > .title { color: #9a6700; }
 .caution { border-color: #d1242f; } .caution > .title { color: #d1242f; }
 li:has(> input[type=checkbox]) { list-style: none; }
-img, .mermaid svg { max-width: 100%; }
-.mermaid { text-align: center; }
-pre, table, img, .mermaid, .katex-display { break-inside: avoid; }
+img, .mermaid svg, .diagram svg { max-width: 100%; }
+.diagram svg { height: auto; }
+.mermaid, .diagram { text-align: center; }
+pre, table, img, .mermaid, .diagram, .katex-display { break-inside: avoid; }
 `;
 
-async function exportDoc({ markdown: text, dir, out, kinds }) {
+async function exportDoc({ markdown: text, dir, out, kinds, d2bin }) {
   markdown ??= await exporter().catch((e) => {
-    throw new Error('export needs a rebuilt renderer (:Lazy build vellum.nvim): ' + e.message);
+    throw new Error('export needs a rebuilt renderer (:Vellum build): ' + e.message);
   });
   // a file:// page may load the document's relative images; about:blank may not
   const tmp = join(tmpdir(), `vellum-export-${process.pid}-${n++}.html`);
@@ -194,7 +297,7 @@ async function exportDoc({ markdown: text, dir, out, kinds }) {
   const doc = await browser.newPage();
   try {
     await doc.goto(pathToFileURL(tmp).href, { waitUntil: 'load' });
-    await doc.addScriptTag({ path: fileURLToPath(import.meta.resolve('mermaid/dist/mermaid.min.js')) });
+    await doc.addScriptTag({ path: MERMAID });
     await doc.evaluate(async (kinds) => {
       // callout types and colors come from the preview (render.lua ALERTS)
       for (const q of document.querySelectorAll('blockquote')) {
@@ -231,6 +334,24 @@ async function exportDoc({ markdown: text, dir, out, kinds }) {
       }
       await document.fonts.ready;
     }, kinds);
+    // D2 compiles in node, in its own light theme; a broken diagram, or a
+    // build without D2, stays as its source
+    const sources = await doc.$$eval('pre > code.language-d2', (codes) => codes.map((c) => c.textContent));
+    if (sources.length) {
+      const svgs = [];
+      for (const code of sources) svgs.push(await d2svg(code, undefined, dir, d2bin).catch(() => null));
+      await doc.evaluate(async (svgs) => {
+        const codes = [...document.querySelectorAll('pre > code.language-d2')];
+        svgs.forEach((svg, i) => {
+          if (!svg) return;
+          const box = document.createElement('div');
+          box.className = 'diagram';
+          box.innerHTML = svg;
+          codes[i].parentElement.replaceWith(box);
+        });
+        await document.fonts.ready;
+      }, svgs);
+    }
     if (out.endsWith('.pdf')) {
       await doc.pdf({ path: out, format: 'A4', printBackground: true, margin: { top: '12mm', bottom: '12mm', left: '10mm', right: '10mm' } });
     } else {
@@ -240,8 +361,7 @@ async function exportDoc({ markdown: text, dir, out, kinds }) {
       const data = {};
       for (const url of images) {
         try {
-          const file = fileURLToPath(url);
-          data[url] = `data:${MIME[extname(file).toLowerCase()] ?? 'application/octet-stream'};base64,${readFileSync(file).toString('base64')}`;
+          data[url] = dataUrl(fileURLToPath(url));
         } catch {} // a missing image stays a broken link, as in the browser
       }
       const html = await doc.evaluate((data, beside) => {
@@ -295,8 +415,8 @@ function withDensity(png, scale) {
 
 async function render(req) {
   if (req.markdown != null) return exportDoc(req);
-  // diagrams keep the container's padding; images and math are shot at their own size
-  const [draw, shot] = req.image ? [picture, '#c img'] : req.math != null ? [formula, '#m'] : [diagram, '#c'];
+  // mermaid keeps the container's padding; D2 pads itself; images and math are shot at their own size
+  const [draw, shot] = req.image ? [picture, '#c img'] : req.math != null ? [formula, '#m'] : req.d2 != null ? [d2diagram, '#c > svg'] : [diagram, '#c'];
   const error = await draw(req);
   if (error) return { out: req.out, error };
   const element = await page.$(shot);
