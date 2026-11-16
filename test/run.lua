@@ -315,7 +315,94 @@ do
   vim.wait(50)
   vellum.toggle()
   check('reopens after :close', #vim.api.nvim_tabpage_list_wins(0) == 2)
+  pbuf = vim.fn.bufnr('vellum://preview')
+  vim.cmd('enew')
+  vim.bo.filetype = 'markdown.mdx' -- MDX as some configs set it up
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'Four' })
+  vim.api.nvim_exec_autocmds('BufEnter', { buffer = 0 })
+  vellum.redraw()
+  check('follows an mdx buffer', shown('Four'))
+  -- Neovim gives .mdx no filetype; the name is enough
+  vim.cmd('enew')
+  vim.api.nvim_buf_set_name(0, vim.fn.tempname() .. '.mdx')
+  check('plain nvim gives .mdx no filetype', vim.bo.filetype == '', vim.bo.filetype)
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { 'Five' })
+  vim.api.nvim_exec_autocmds('BufEnter', { buffer = 0 })
+  vellum.redraw()
+  check('follows an .mdx file with no filetype', shown('Five'))
   vellum.close()
+end
+
+-- MDX: import/export statements and {/* comments */} are hidden, in place;
+-- the same words in code, quotes or prose, and in a .md file, stay
+do
+  local text = table.concat({
+    'import { Chart } from "./chart"',
+    'export const meta = {',
+    '  title: "x",',
+    '}',
+    '',
+    '# Title',
+    '',
+    '{/* a hidden note */}',
+    '',
+    'Words like import stay in prose.',
+    '',
+    '```js',
+    'import x from "y"',
+    '```',
+    '',
+    '> export in a quote stays',
+    '',
+    '## Sub',
+    '',
+    'export default Layout',
+  }, '\n')
+  local function shows(name)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(buf, vim.fn.tempname() .. name)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(text, '\n'))
+    render.reset()
+    local lines, _, _, anchors = render.render(buf, 84, 100)
+    return function(pat) return find(lines, pat) ~= nil end, anchors
+  end
+  local has, anchors = shows('.mdx')
+  check('mdx import hidden', not has('Chart'))
+  check('mdx multi-line export hidden', not has('meta') and not has('title'))
+  check('mdx export in a section hidden', not has('Layout'))
+  check('mdx comment hidden', not has('hidden note'))
+  check('mdx keeps headings and prose', has('Title') and has('Sub') and has('like import stay'))
+  check('mdx keeps code', has('import x from'))
+  check('mdx keeps quotes', has('export in a quote'))
+  check('mdx rows stay put', anchors[1] and anchors[1][1] == 5, vim.inspect(anchors[1]))
+  has = shows('.md')
+  check('markdown shows the same text', has('Chart') and has('hidden note'))
+  -- hiding is part of the block cache key: an .md after an .mdx still shows
+  -- what the .mdx hid, top-level and inside a cached heading section
+  local function named(name, lines)
+    local b = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(b, vim.fn.tempname() .. name)
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
+    return b
+  end
+  local plain = { 'import { Chart } from "./chart"', '', '# Title', '', 'para', '', '## Sub', '', 'export default Layout' }
+  render.render(named('.mdx', plain), 84, 100)
+  local md_lines = render.render(named('.md', plain), 84, 100)
+  check('mdx hiding is not cached into markdown', find(md_lines, 'Chart') ~= nil and find(md_lines, 'Layout') ~= nil)
+  local buf = named('.mdx', vim.split(text, '\n'))
+  local out = require('vellum.mdx').lines(buf)
+  check('mdx export blanks statements and comments in place', #out == 20 and out[1] == '' and out[4] == ''
+    and out[8] == '' and out[20] == '' and out[6] == '# Title' and out[13] == 'import x from "y"', vim.inspect(out))
+end
+
+-- PNG files for image checks; only their headers are read
+local function u32(n) return string.char(math.floor(n / 16777216) % 256, math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256) end
+local function phys(ppm, unit) return u32(9) .. 'pHYs' .. u32(ppm) .. u32(ppm) .. string.char(unit or 1) .. u32(0) end
+local function write_png(path, w, h, chunk) -- CRCs are zero: only the headers are read
+  local f = io.open(path, 'wb')
+  f:write('\137PNG\r\n\26\n' .. u32(13) .. 'IHDR' .. u32(w) .. u32(h) .. string.rep('\0', 5) .. u32(0) .. (chunk or '') .. u32(0) .. 'IEND' .. u32(0))
+  f:close()
+  return path
 end
 
 -- images: a small one stays centered at natural size, a very wide one
@@ -323,12 +410,7 @@ end
 do
   local dir = vim.fn.tempname()
   vim.fn.mkdir(dir, 'p')
-  local function png(name, w, h) -- only the header is read for the size
-    local function u32(n) return string.char(math.floor(n / 16777216) % 256, math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256) end
-    local f = io.open(dir .. '/' .. name, 'wb')
-    f:write('\137PNG\r\n\26\n' .. u32(13) .. 'IHDR' .. u32(w) .. u32(h))
-    f:close()
-  end
+  local function png(name, w, h) write_png(dir .. '/' .. name, w, h) end
   png('wide.png', 9000, 600)
   png('small.png', 200, 100)
   png('badge.png', 80, 20)
@@ -350,6 +432,37 @@ do
   check('badges sit in the text line', row and row:find('ok$') and select(2, row:gsub(ph, '')) == 2 * cells, row)
   local i = find(badges, '^%s*see$')
   check('big image in text gets its own lines', i and badges[i + 1]:find(ph) and find(badges, '^%s*below$'), vim.inspect(badges))
+  -- the preview frees images it no longer shows (old versions of an edited
+  -- diagram filled kitty's image memory), never the zoom viewer's
+  local drop, dropped = image.drop, {}
+  image.drop = function(id) dropped[id] = true end
+  image.supported = true
+  local function shown_by(text)
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.split(text, '\n'))
+    return select(5, render.render(buf, 84, 100))
+  end
+  local wide, small_id = image.id(dir .. '/wide.png'), image.id(dir .. '/small.png')
+  local both = shown_by('![w](' .. dir .. '/wide.png)\n\n![s](' .. dir .. '/small.png)')
+  check('render reports the images it shows', both[wide] and both[small_id], vim.inspect(both))
+  local zoom_id = image.id(dir .. '/wide.png#zoom')
+  image.grid(zoom_id, dir .. '/wide.png', 4, 2, 0, 0, 2, 4)
+  image.keep(shown_by('![s](' .. dir .. '/small.png)'))
+  check('an image no longer shown is freed; shown and zoom ones stay', dropped[wide] and not dropped[small_id] and not dropped[zoom_id], vim.inspect(dropped))
+  -- images are sent when first drawn, within a budget: drawing a third
+  -- 64 MB image frees the least recently drawn one that is off screen
+  dropped = {}
+  local big = {}
+  for i = 1, 3 do
+    big[i] = image.id(write_png(dir .. '/big' .. i .. '.png', 4000, 4000))
+    image.lines(dir .. '/big' .. i .. '.png', 10, 10)
+  end
+  for i = 1, 3 do
+    image.next_frame()
+    image.show(big[i])
+  end
+  check('over budget, the least recently drawn image is freed', dropped[big[1]] and not dropped[big[2]] and not dropped[big[3]], vim.inspect(dropped))
+  image.drop, image.supported = drop, false
 end
 
 -- images need 'termguicolors', read when used: Neovim may set it after startup
@@ -391,16 +504,8 @@ end
 
 -- a rendered PNG's density (pixels per CSS px) comes from the pHYs chunk the
 -- renderer writes right after IHDR, in pixels per metre at 96 CSS px per inch
-local function u32(n) return string.char(math.floor(n / 16777216) % 256, math.floor(n / 65536) % 256, math.floor(n / 256) % 256, n % 256) end
-local function phys(ppm, unit) return u32(9) .. 'pHYs' .. u32(ppm) .. u32(ppm) .. string.char(unit or 1) .. u32(0) end
-local function write_png(path, w, h, chunk) -- CRCs are zero: only the headers are read
-  local f = io.open(path, 'wb')
-  f:write('\137PNG\r\n\26\n' .. u32(13) .. 'IHDR' .. u32(w) .. u32(h) .. string.rep('\0', 5) .. u32(0) .. (chunk or '') .. u32(0) .. 'IEND' .. u32(0))
-  f:close()
-  return path
-end
 do
-  local function density(chunk) return image.png_density(write_png(vim.fn.tempname(), 10, 10, chunk)) end
+  local function density(chunk) return select(3, image.png_size(write_png(vim.fn.tempname(), 10, 10, chunk))) end
   check('2x density from pHYs', density(phys(7559)) == 2, density(phys(7559)))
   check('capped density from pHYs', density(phys(4762)) == 1.26, density(phys(4762)))
   check('no pHYs, no density', density(nil) == nil)
@@ -427,6 +532,77 @@ do
   local media = require('vellum.media')
   local wide, narrow = media.picture(full_file, full[1], full[2], 300, full[3]), media.picture(capped_file, capped[1], capped[2], 300, capped[3])
   check('capped diagram keeps its width', cols(wide) == cols(narrow), cols(wide) .. ' vs ' .. cols(narrow))
+end
+
+-- render loaders: none while a render is fast; then a spinner label over a new
+-- diagram's code, or a badge over an edited diagram's old picture
+do
+  local browser, code = require('vellum.browser'), require('vellum.code')
+  local diagram, supported, tgc = browser.diagram, image.supported, vim.o.termguicolors
+  image.supported, vim.o.termguicolors = true, true
+  code.reset()
+  -- a fast render shows no loader, and the preview is told when one is due
+  browser.diagram = function() return 'pending', 100 end
+  local quick = code.diagram('graph LR; A --> B', 40, 99, 'mermaid')
+  local due_in = code.due and code.due - vim.uv.now()
+  check('fast new diagram has no spinner', quick[1][2][2] == 'VellumCodeLabel' and due_in and due_in > 250 and due_in <= 300 and not code.loading,
+    vim.inspect(quick[1]) .. ' ' .. tostring(due_in))
+  code.due = nil
+  browser.diagram = function() return 'pending', 5000 end
+  local out = code.diagram('graph LR; A --> B', 40, 99, 'mermaid')
+  local head = out[1]
+  local text = table.concat(vim.tbl_map(function(s) return s[1] end, head))
+  check('pending diagram has a spinner label', head[2][1] == '⠋ rendering…' and head[2][2] == 'VellumSpinner' and code.loading, vim.inspect(head))
+  code.loading = false
+  check('spinner label fits the panel', vim.api.nvim_strwidth(text) == 40, text)
+  check('pending diagram shows its code', out[2][2][1] == 'graph LR; A --> B')
+
+  -- an edit keeps the old picture, with a badge over the last 12 cells of its top row
+  local file = vim.fn.tempname() .. '.png'
+  write_png(file, 400, 100)
+  browser.diagram = function() return 'ready', file, { 400, 100, 1 } end
+  local ready = code.diagram('graph LR; A --> B', 40, 99, 'mermaid')
+  browser.diagram = function() return 'pending', 200 end
+  check('fast edit keeps the picture without a badge', code.diagram('graph LR; A --> C', 40, 99, 'mermaid') == ready and code.due and not code.loading)
+  code.due = nil
+  browser.diagram = function() return 'pending', 5000 end
+  local updating = code.diagram('graph LR; A --> C', 40, 99, 'mermaid')
+  browser.diagram, image.supported, vim.o.termguicolors = diagram, supported, tgc
+  local top, ph = updating[1], image.placeholder
+  check('updating picture keeps its rows', #updating == #ready and updating[2] == ready[2])
+  check('updating badge replaces trailing cells only', top[3] and top[3][2] == 'VellumBadge' and top[3][1] == ' ⠋ updating '
+    and top[2][1] .. ph:rep(12) == ready[1][2][1], vim.inspect(top[3]))
+  check('ready picture has no badge', #ready[1] == 2)
+end
+
+-- D2: fenced like mermaid; shown as code without image support, else a
+-- picture keyed by theme, folder, local icon versions and code
+do
+  local lines = doc('```d2\nserver -> db: query\n```')
+  check('d2 without images shows its code', find(lines, 'server %-> db: query') ~= nil)
+  local browser = require('vellum.browser')
+  local theme = require('vellum.theme')
+  local cache = vim.fn.stdpath('cache') .. '/vellum'
+  local dir = vim.fn.tempname()
+  vim.fn.mkdir(dir .. '/icons', 'p')
+  vim.fn.writefile({ '<svg/>' }, dir .. '/icons/a b.svg')
+  local code = 'a: { icon: "./icons/a b.svg" }\nb.icon: https://example.com/b.svg\na -> b'
+  local function key()
+    local s = vim.uv.fs_stat(dir .. '/icons/a b.svg')
+    local d2 = browser.d2_command()
+    local by = d2 and d2.bin .. ' ' .. d2.version or 'bundled'
+    return table.concat({ 'd2', by, theme.d2_signature, dir, './icons/a b.svg\0' .. s.mtime.sec .. '.' .. s.size, code }, '\0')
+  end
+  local function cached(k) return write_png(cache .. '/' .. vim.fn.sha256(k):sub(1, 32) .. '.png', 300, 100, phys(7559)) end
+  local first = cached(key())
+  local state, file = browser.diagram(code, theme, 'd2', dir)
+  check('d2 diagram is found by its key, a URL icon not read as a file', state == 'ready' and file == first, vim.inspect({ state, file }))
+  vim.fn.writefile({ '<svg></svg>' }, dir .. '/icons/a b.svg') -- one byte more
+  local second = cached(key())
+  state, file = browser.diagram(code, theme, 'd2', dir)
+  check('an edited local icon is a new d2 picture', state == 'ready' and file == second and second ~= first, vim.inspect({ state, file }))
+  check('the d2 theme follows the lightness of the colorscheme',
+    theme.d2.themeID == (vim.o.background == 'dark' and 200 or 0) and theme.d2.themeOverrides.N7 == theme.mermaid.background)
 end
 
 -- Obsidian: callouts, ==highlight==, [[wikilinks]]
@@ -471,7 +647,7 @@ do
     '| --- |',
     '| [cell](#setup) |',
     '',
-    '[far](other%20file.md#deep-part) [gone](missing.md) [dup](#setup-1) [[deeper]] [[nowhere]] [[other file#Deep part|wiki]] [[100%25 done]] [snake](#snake_case-option) [dash](#école--vu)',
+    '[far](other%20file.md#deep-part) [gone](missing.md) [dup](#setup-1) [[deeper]] [[nowhere]] [[other file#Deep part|wiki]] [[100%25 done]] [snake](#snake_case-option) [dash](#école--vu) [mdx page](page.mdx)',
     '',
     '## Setup',
     '',
@@ -483,6 +659,7 @@ do
     '',
     '[r]: https://example.com/ref',
   }, dir .. '/main.md')
+  vim.fn.writefile({ '# Page' }, dir .. '/page.mdx')
   local opened
   local ui_open = vim.ui.open
   vim.ui.open = function(t) opened = t end
@@ -524,6 +701,9 @@ do
   check('anchor: letters kept, a dash dropped, as GitHub', click('dash') and vim.api.nvim_get_current_line() == '## École — vu')
   vim.cmd.edit(dir .. '/main.md')
   vim.wait(50)
+  check('mdx file opens in the editor', click('mdx page') and vim.api.nvim_buf_get_name(0):match('page%.mdx$'), opened)
+  vim.cmd.edit(dir .. '/main.md')
+  vim.wait(50)
   check('relative markdown file opens at its heading', click('far') and vim.api.nvim_buf_get_name(0):match('other file%.md$')
     and vim.api.nvim_win_get_cursor(src)[1] == #other - 2)
   local plines = vim.api.nvim_buf_get_lines(vim.fn.winbufnr(pwin), 0, -1, false)
@@ -560,9 +740,43 @@ do
   require('vellum').export('out.docx')
   check('export needs .pdf or .html', said and said:find('%.pdf or %.html'), said)
   said = nil
+  vim.cmd('enew')
+  vim.bo.filetype = 'markdown.mdx'
+  require('vellum').export('out.docx')
+  check('export takes mdx', said and said:find('%.pdf or %.html'), said)
+  said = nil
   vim.cmd('runtime plugin/vellum.lua') -- nvim -l loads no plugin files
   vim.cmd('Vellum nonsense')
   check('unknown subcommand', said and said:find('unknown command'), said)
+  -- build is wired to the renderer build; stubbed, so no terminal opens here
+  local ran = false
+  package.loaded['vellum.build'] = { run = function() ran = true end }
+  vim.cmd('Vellum build')
+  check(':Vellum build runs the renderer build', ran, said)
+  package.loaded['vellum.build'] = nil
+  local build = dofile('lua/vellum/build.lua')
+  check('renderer build installs deps then the headless shell',
+    build.commands[1][1] == 'npm' and build.commands[2][1] == 'npx'
+      and vim.uv.fs_stat(build.root .. '/render/package.json') ~= nil, vim.inspect({ build.root, build.commands }))
+  -- a root with % and # in it: :terminal {cmd} would have expanded them
+  local root = vim.fn.tempname() .. '/a%b#c'
+  vim.fn.mkdir(root .. '/render', 'p')
+  build.root = root
+  local jobstart, argv, opts = vim.fn.jobstart, nil, nil
+  vim.fn.jobstart = function(a, o) argv, opts = a, o; return 1 end
+  local wins = #vim.api.nvim_list_wins()
+  build.run()
+  check(':Vellum build runs both steps in render/, in a new window',
+    argv and argv[1] == 'sh' and argv[3] == 'npm ci && npx puppeteer browsers install chrome-headless-shell'
+      and opts.term and opts.cwd == root .. '/render' and #vim.api.nvim_list_wins() == wins + 1, vim.inspect({ argv, opts }))
+  vim.cmd('close')
+  -- a renderer built by a package manager (Nix) is read-only
+  vim.uv.fs_chmod(root .. '/render', tonumber('555', 8))
+  said, argv = nil, nil
+  build.run()
+  check(':Vellum build refuses a read-only renderer', said and said:find('read%-only') and argv == nil, said)
+  vim.uv.fs_chmod(root .. '/render', tonumber('755', 8))
+  vim.fn.jobstart = jobstart
   vim.notify = notify
 end
 
@@ -661,6 +875,75 @@ do
   check('the preview closes with its source tab', vim.fn.bufnr('vellum://preview') == -1
     and #vim.api.nvim_list_tabpages() == tabs, vim.inspect(vim.api.nvim_list_tabpages()))
   vellum.setup({ tab = false })
+end
+
+-- setup: bad options are skipped with a warning; split and size place the
+-- preview; auto_open opens it on markdown in a file window; users' own
+-- Vellum* colors win over the derived ones
+do
+  local vellum = require('vellum')
+  local notify, said = vim.notify, nil
+  vim.notify = function(m) said = m end
+  vellum.setup({ max_widht = 80, tab = 'yes', split = 'top', size = 0.5, max_width = 90 })
+  check('setup names every bad option', said and said:find('max_widht') and said:find('tab should be a boolean')
+    and said:find('split should be') and said:find('size should be'), said)
+  check('setup keeps good options and defaults for bad ones', vellum.config.max_width == 90 and vellum.config.tab == false
+    and vellum.config.split == 'right' and vellum.config.size == nil, vim.inspect(vellum.config))
+  said = nil
+  vellum.setup({ max_width = 100 })
+  check('good options say nothing', said == nil, said)
+  vim.notify = notify
+
+  vim.cmd('silent! only | enew!')
+  local src = vim.api.nvim_get_current_win()
+  vim.api.nvim_buf_set_lines(0, 0, -1, false, { '# Split' })
+  vim.bo.filetype = 'markdown'
+  vellum.setup({ split = 'left', size = 30 })
+  vellum.open()
+  local pwin = vim.fn.bufwinid('vellum://preview')
+  local pcol, scol = vim.api.nvim_win_get_position(pwin)[2], vim.api.nvim_win_get_position(src)[2]
+  check('split = left, size = 30', pwin > 0 and pcol < scol and vim.api.nvim_win_get_width(pwin) == 30,
+    vim.inspect({ pcol, scol, pwin > 0 and vim.api.nvim_win_get_width(pwin) }))
+  vellum.close()
+  vellum.setup({ split = 'below', size = 8 })
+  vellum.open()
+  pwin = vim.fn.bufwinid('vellum://preview')
+  check('split = below, size = 8', pwin > 0 and vim.api.nvim_win_get_position(pwin)[1] > vim.api.nvim_win_get_position(src)[1]
+    and vim.api.nvim_win_get_height(pwin) == 8)
+  vellum.close()
+
+  vim.api.nvim_set_hl(0, 'VellumH1', { fg = '#ff0000' })
+  vellum.open()
+  check("a user's Vellum* color survives opening", vim.api.nvim_get_hl(0, { name = 'VellumH1' }).fg == 0xff0000)
+  vellum.close()
+  local au = vim.api.nvim_create_autocmd('ColorScheme', { callback = function() vim.api.nvim_set_hl(0, 'VellumH1', { fg = '#00ff00' }) end })
+  vellum.open()
+  vim.cmd('colorscheme default')
+  vim.wait(50)
+  check("a user's Vellum* color set on ColorScheme survives a colorscheme change", vim.api.nvim_get_hl(0, { name = 'VellumH1' }).fg == 0x00ff00)
+  vellum.close()
+  vim.api.nvim_del_autocmd(au)
+  vim.cmd('colorscheme default')
+  vim.wait(50)
+  check('without one, the derived color comes back', vim.api.nvim_get_hl(0, { name = 'VellumH1' }).fg ~= 0x00ff00)
+
+  vellum.setup({ split = 'right', auto_open = true })
+  local scratch = vim.api.nvim_create_buf(false, true)
+  vim.bo[scratch].filetype = 'markdown'
+  vim.api.nvim_set_current_buf(scratch) -- like a hover or picker preview: markdown, but not a file
+  vim.wait(50)
+  check('auto_open skips markdown that is not a file', vim.fn.bufwinid('vellum://preview') == -1)
+  local file = vim.fn.tempname() .. '.md'
+  vim.fn.writefile({ '# Auto' }, file)
+  vim.cmd.edit(file)
+  vim.wait(50)
+  check('auto_open opens on a markdown file', vim.fn.bufwinid('vellum://preview') > 0)
+  vellum.close()
+  vellum.setup({ auto_open = false })
+  vim.cmd('enew')
+  vim.cmd.edit(file)
+  vim.wait(50)
+  check('auto_open off: nothing opens', vim.fn.bufwinid('vellum://preview') == -1)
 end
 
 print(('%d checks, %d failed'):format(count, failed))

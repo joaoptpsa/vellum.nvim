@@ -4,14 +4,17 @@ local image = require('vellum.image')
 local theme = require('vellum.theme')
 local inline = require('vellum.inline')
 local media = require('vellum.media')
+local browser = require('vellum.browser')
 local code = require('vellum.code')
 local latex = require('vellum.latex')
+local mdx = require('vellum.mdx')
 
 local ts = vim.treesitter
 local strwidth = vim.api.nvim_strwidth
 local M = {}
 
 local src = {}
+local is_mdx = false -- the rendered buffer is MDX (see mdx.lua)
 local cache, used = {}, {} -- rendered blocks by (type, width, depth, source text)
 local depth = 0 -- list nesting, picks the bullet glyph
 
@@ -49,11 +52,7 @@ local function text_of(node, from)
   return (table.concat(out, '\n'):gsub(ZWSP, ''))
 end
 
-local function child(node, type)
-  for c in node:iter_children() do
-    if c:type() == type then return c end
-  end
-end
+local child = inline.child
 
 -- Named children that carry content, skipping types matching `skip`.
 local function kids(node, skip)
@@ -122,24 +121,33 @@ end
 function render_block(node, width)
   local t = node:type()
   local fn = R[t] or R.fallback
-  if t == 'section' or t == 'document' then return fn(node, width) end
-  local key = table.concat({ t, width, depth, text_of(node) }, '\0')
+  if t == 'document' then return fn(node, width) end
+  -- a section of an .mdx file hides MDX lines (content), so MDX is part of the key
+  local key = table.concat({ t, width, depth, is_mdx and 'mdx' or '', text_of(node) }, '\0')
   local hit = used[key] or cache[key]
   if hit then
     used[key] = hit
     return hit[1], hit[2]
   end
-  local v = media.pending
+  local v = browser.waiting
   local lines, anchors = fn(node, width)
   if not anchors then
     local sr, _, er, ec = node:range()
     anchors = { { 0, math.max(1, er - sr + (ec > 0 and 1 or 0)), 0, #lines } }
   end
-  if v == media.pending then used[key] = { lines, anchors } end
+  if v == browser.waiting then used[key] = { lines, anchors } end
   return lines, anchors
 end
 
-function R.document(node, width) return blocks(kids(node), width, (node:start())) end
+-- The blocks of the document or of a heading's section. MDX statements and
+-- comments vanish here, like HTML comments, so rows and anchors stay put.
+local function content(node)
+  local out = kids(node)
+  if is_mdx then out = vim.tbl_filter(function(n) return not mdx.hidden(n, src) end, out) end
+  return out
+end
+
+function R.document(node, width) return blocks(content(node), width, (node:start())) end
 R.section = R.document
 
 local function heading(level, text, width)
@@ -163,16 +171,12 @@ local function heading(level, text, width)
   return out
 end
 
+-- An ATX heading holds its inline text; a setext one holds it in a paragraph.
 function R.atx_heading(node, width)
-  local inl = child(node, 'inline')
+  local inl = child(child(node, 'paragraph') or node, 'inline')
   return heading(heading_level(node), inl and text_of(inl, inl) or '', width)
 end
-
-function R.setext_heading(node, width)
-  local p = child(node, 'paragraph')
-  local inl = p and child(p, 'inline')
-  return heading(heading_level(node), inl and text_of(inl, inl) or '', width)
-end
+R.setext_heading = R.atx_heading
 
 -- "[^label]: text" lines, which tree-sitter sees as one plain paragraph.
 local function footnotes(text, width)
@@ -207,7 +211,8 @@ function R.fenced_code_block(node, width)
   local lang = info and text_of(info):match('^%s*([%w_+#.-]+)') -- "json,title=x" and "{r}" carry more than a language
   local body = child(node, 'code_fence_content')
   local text = body and text_of(body, node) or ''
-  if lang and lang:lower() == 'mermaid' and image.supported then return code.diagram(text, width, (node:start())) end
+  local diagram = lang and ({ mermaid = 'mermaid', d2 = 'd2' })[lang:lower()]
+  if diagram and image.supported then return code.diagram(text, width, (node:start()), diagram) end
   if lang and lang:lower() == 'math' then return inline.display(text, width, (node:start())) end
   return code.panel(text, lang, width)
 end
@@ -281,7 +286,7 @@ function R.list(node, width)
   depth = depth + 1
   local items = kids(node)
   local marker = items[1] and items[1]:named_child(0)
-  local ordered = marker and marker:type():match('_dot$') or marker and marker:type():match('_parenthesis$')
+  local ordered = marker and (marker:type():match('_dot$') or marker:type():match('_parenthesis$'))
   local start = ordered and tonumber(text_of(marker):match('%d+')) or 1
   local mw = ordered and #tostring(start + #items - 1) + 2 or 2
   local lines, anchors = {}, {}
@@ -436,6 +441,7 @@ function R.fallback(node, width) return inline.wrap({ { text_of(node, node), { '
 -- margin), the margin width, and anchors for scroll sync.
 function M.render(buf, win_width, max_width)
   src = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  is_mdx = mdx.is(buf)
   media.dir = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ':p:h')
   local width = math.max(20, math.min(win_width - 4, max_width))
   local margin = string.rep(' ', math.max(0, math.floor((win_width - width) / 2)))
@@ -462,28 +468,34 @@ function M.render(buf, win_width, max_width)
     end
     if fixed then root = ts.get_string_parser(table.concat(src, '\n'), 'markdown'):parse()[1]:root() end
   end
-  local body, anchors = blocks(kids(root), width, 0)
+  local body, anchors = blocks(content(root), width, 0)
   cache, used = used, {}
-  local text, rows = { '' }, { {} } -- a blank first line for breathing room
+  local text, rows, shown = { '' }, { {} }, {} -- a blank first line for breathing room; shown: image ids
   for i, line in ipairs(body) do
     -- flattened once per line object; cached blocks reuse theirs
     if not line.flat then
-      local parts, marks, col = {}, {}, 0
+      local parts, marks, col, images = {}, {}, 0, nil
       for _, s in ipairs(line) do
         local len = #s[1]
         local group = s[2] and theme.merge(s[2])
         if group and len > 0 then marks[#marks + 1] = { col, col + len, group, 100, s.link } end
+        local id = group and image.id_of(group)
+        if id then
+          images = images or {}
+          images[#images + 1] = id
+        end
         for k, m in ipairs(s[3] or {}) do marks[#marks + 1] = { col + m[1], col + m[2], m[3], 100 + k } end
         parts[#parts + 1] = s[1]
         col = col + len
       end
-      line.flat = { table.concat(parts), marks }
+      line.flat = { table.concat(parts), marks, images }
     end
     text[i + 1] = margin .. line.flat[1]
     rows[i + 1] = line.flat[2]
+    for _, id in ipairs(line.flat[3] or {}) do shown[id] = true end
   end
   for _, a in ipairs(anchors) do a[3] = a[3] + 1 end
-  return text, rows, #margin, anchors
+  return text, rows, #margin, anchors, shown
 end
 
 return M

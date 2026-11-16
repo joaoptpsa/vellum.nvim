@@ -39,11 +39,12 @@ function M.apply()
   local muted = get('Comment', 'fg') or blend(fg, bg, 0.5)
   local border = blend(fg, bg, 0.22)
   local ok, info, warn, err = pick('DiagnosticOk', 'String'), pick('DiagnosticInfo'), pick('DiagnosticWarn'), pick('DiagnosticError')
-  local set = function(name, v) vim.api.nvim_set_hl(0, 'Vellum' .. name, v) end
+  -- default: a user's own `:hi VellumH1 ...` wins. :colorscheme clears every
+  -- group first, so these still follow a new colorscheme
+  local set = function(name, v) vim.api.nvim_set_hl(0, 'Vellum' .. name, vim.tbl_extend('force', v, { default = true })) end
 
   for i, c in ipairs(h) do set('H' .. i, { fg = c, bold = i < 6, italic = i >= 5 }) end
   set('H1Band', { fg = h[1], bg = blend(h[1], bg, 0.16), bold = true })
-  set('Text', { fg = fg })
   set('Muted', { fg = muted })
   set('Border', { fg = border })
   set('Bold', { bold = true })
@@ -52,8 +53,11 @@ function M.apply()
   set('Code', { fg = h[5], bg = blend(fg, bg, 0.09) })
   set('Math', { fg = h[6] })
   M.math = hex(h[6]) -- display math pictures match the text shown while they render
-  set('CodeBg', { bg = blend(fg, bg, 0.05) })
-  set('CodeLabel', { fg = muted, bg = blend(fg, bg, 0.05), italic = true })
+  local code_bg = blend(fg, bg, 0.05)
+  set('CodeBg', { bg = code_bg })
+  set('CodeLabel', { fg = muted, bg = code_bg, italic = true })
+  set('Spinner', { fg = h[1], bg = code_bg, bold = true })
+  set('Badge', { fg = bg, bg = h[1], bold = true })
   set('Link', { fg = h[1], underline = true, sp = blend(h[1], bg, 0.5) })
   set('Mark', { fg = fg, bg = blend(warn, bg, 0.3) }) -- ==highlight==
   set('Bullet', { fg = h[1], bold = true })
@@ -105,11 +109,26 @@ function M.apply()
   end
   -- sorted: table order changes between sessions, and this is part of the disk cache key
   M.signature = vim.json.encode(M.mermaid, { sort_keys = true })
+
+  -- D2: a base theme of the right lightness (200 is dark; the base picks the
+  -- syntax colors of code labels) under overrides for every theme color. N1
+  -- is text and N7 the background, N2-N6 the greys between; B are the main
+  -- strokes and fills, AA and AB the accent ones.
+  M.d2 = { themeID = dark and 200 or 0, themeOverrides = {
+    N1 = hex(fg), N2 = hex(blend(fg, bg, 0.72)), N3 = hex(blend(fg, bg, 0.5)), N4 = hex(border),
+    N5 = hex(blend(fg, bg, 0.14)), N6 = hex(blend(fg, bg, 0.07)), N7 = hex(bg),
+    B1 = hex(h[1]), B2 = hex(h[1]), B3 = hex(blend(h[1], bg, 0.35)), B4 = hex(blend(h[1], bg, 0.18)),
+    B5 = hex(blend(h[1], bg, 0.1)), B6 = hex(blend(h[1], bg, 0.05)),
+    AA2 = hex(h[2]), AA4 = hex(blend(h[2], bg, 0.18)), AA5 = hex(blend(h[2], bg, 0.08)),
+    AB4 = hex(blend(h[3], bg, 0.18)), AB5 = hex(blend(h[3], bg, 0.08)),
+  } }
+  M.d2_signature = vim.json.encode(M.d2, { sort_keys = true })
 end
 
 -- One highlight group combining `groups` in order, later ones winning.
 function M.merge(groups)
-  if type(groups) == 'string' or #groups < 2 then return type(groups) == 'string' and groups or groups[1] end
+  if type(groups) == 'string' then return groups end
+  if #groups < 2 then return groups[1] end
   local name = 'Vellum_' .. table.concat(groups, '_'):gsub('Vellum', '')
   if not merged[name] then
     local attrs = {}

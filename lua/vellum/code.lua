@@ -1,5 +1,5 @@
 -- Code blocks: shaded panels with tree-sitter syntax colors, and mermaid
--- diagrams rendered to images.
+-- and D2 diagrams rendered to images.
 local image = require('vellum.image')
 local browser = require('vellum.browser')
 local theme = require('vellum.theme')
@@ -11,6 +11,22 @@ local strwidth = vim.api.nvim_strwidth
 local M = {}
 
 local last_diagram = {} -- source row → last ready diagram, shown while an edit re-renders
+
+-- A loader that flashes for a fast render looks worse than none, so it shows
+-- only once the wait is noticeable. The preview resets these before a draw and
+-- reads them after (init.lua): M.loading, a loader is shown, so it turns the
+-- spinner; M.due, the vim.uv.now() when the next one is due, to draw again then.
+M.SPINNER = { '⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏' }
+local SPINNER_AFTER, BADGE_AFTER = 400, 1000
+
+local function due(elapsed, after)
+  if elapsed >= after then
+    M.loading = true
+    return true
+  end
+  M.due = math.min(M.due or math.huge, vim.uv.now() + after - elapsed)
+  return false
+end
 
 function M.reset() last_diagram = {} end
 
@@ -74,17 +90,26 @@ function M.panel(code, lang, width, label, err)
   return out
 end
 
-function M.diagram(code, width, row)
-  if image.problem() then return M.panel(code, 'mermaid', width, nil, image.problem()) end
-  local state, a, b = browser.diagram(code, theme)
+-- A diagram in `lang`, 'mermaid' or 'd2', as a picture; its code while it
+-- first renders, or with the error when it cannot.
+function M.diagram(code, width, row, lang)
+  if image.problem() then return M.panel(code, lang, width, nil, image.problem()) end
+  local state, a, b = browser.diagram(code, theme, lang, media.dir)
   if state == 'ready' then
     last_diagram[row] = media.picture(a, b[1], b[2], width, b[3])
     return last_diagram[row]
   elseif state == 'error' then
-    return M.panel(code, 'mermaid', width, nil, a)
+    return M.panel(code, lang, width, nil, a)
   end
-  media.pending = media.pending + 1
-  return last_diagram[row] or M.panel(code, 'mermaid', width, 'rendering…')
+  local last = last_diagram[row]
+  if not last then
+    if not due(a, SPINNER_AFTER) then return M.panel(code, lang, width) end
+    local out = M.panel(code, lang, width, M.SPINNER[1] .. ' rendering…')
+    out[1][2][2] = 'VellumSpinner' -- the preview turns its first glyph (init.lua)
+    return out
+  end
+  -- an edit keeps the old picture, badged once the wait is noticeable
+  return due(a, BADGE_AFTER) and media.badge(last, ' ' .. M.SPINNER[1] .. ' updating ') or last
 end
 
 return M
